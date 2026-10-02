@@ -1187,9 +1187,12 @@ async def _ingest_inbound_files(thread_id: str, msg: InboundMessage, *, user_id:
 
             created.append(
                 {
-                    "filename": safe_name,
+                    # Same-name collisions land under the next free ``_N``
+                    # suffix; report the name the bytes actually landed under
+                    # (issue #3750).
+                    "filename": dest.name,
                     "size": len(data),
-                    "path": f"/mnt/user-data/uploads/{safe_name}",
+                    "path": f"/mnt/user-data/uploads/{dest.name}",
                     "is_image": ftype == "image",
                 }
             )

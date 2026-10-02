@@ -207,6 +207,15 @@ def cleanup_stale_upload_staging_files(base_dir: Path | str | None = None) -> in
     return removed
 
 
+def _existing_dir_names(base_dir: Path) -> set[str]:
+    """Snapshot the names currently in *base_dir* (empty set when it cannot be scanned)."""
+    try:
+        with os.scandir(base_dir) as entries:
+            return {entry.name for entry in entries}
+    except OSError:
+        return set()
+
+
 def open_upload_file_no_symlink(base_dir: Path, filename: str) -> tuple[Path, object]:
     """Open an upload destination for safe streaming writes.
 
@@ -218,6 +227,16 @@ def open_upload_file_no_symlink(base_dir: Path, filename: str) -> tuple[Path, ob
     and ``fstat`` validation after ``open()`` to reduce the TOCTOU window; this does
     not eliminate all races but makes exploitation significantly harder. Path-traversal
     validation prevents escapes from *base_dir* in both cases.
+
+    Same-name collisions never destroy the existing file: the destination is opened
+    with ``O_EXCL`` (so a pre-existing file can never be opened and truncated), and
+    on :class:`FileExistsError` the next free ``_N`` suffix is claimed against the
+    directory's current contents via :func:`claim_unique_filename` — the same helper
+    the Gateway ingestion pipeline and the channel ingress paths use — and the open
+    is retried. Two concurrent uploads of one name therefore land as ``name.ext``
+    and ``name_1.ext`` with both byte streams intact, instead of racing on one inode
+    (issue #3750). The returned path is the name the bytes actually landed under;
+    callers must report it (not the requested name) back to users.
     """
     safe_name = normalize_filename(filename)
     dest = validate_upload_destination(base_dir, safe_name)
@@ -230,22 +249,35 @@ def open_upload_file_no_symlink(base_dir: Path, filename: str) -> tuple[Path, ob
 
     if has_nofollow:
         # POSIX: O_NOFOLLOW makes open() fail with ELOOP if dest is a symlink.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+        # O_EXCL makes open() fail with EEXIST if dest already exists, so an
+        # upload can never open and truncate an earlier file of the same name.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_EXCL
         if hasattr(os, "O_NONBLOCK"):
             flags |= os.O_NONBLOCK
 
-        try:
-            fd = os.open(dest, flags, 0o600)
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
-                raise UnsafeUploadPathError(f"Unsafe upload destination: {safe_name}") from exc
-            raise
+        seen: set[str] | None = None
+        while True:
+            try:
+                fd = os.open(dest, flags, 0o600)
+                break
+            except FileExistsError:
+                # Regular-file collision: claim the next free ``_N`` suffix
+                # against the directory's current contents and retry. The
+                # existing file is never opened, so its bytes survive intact,
+                # and the O_EXCL retry keeps concurrent uploads off one inode.
+                if seen is None:
+                    seen = _existing_dir_names(base_dir)
+                seen.add(dest.name)
+                dest = base_dir / claim_unique_filename(dest.name, seen)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
+                    raise UnsafeUploadPathError(f"Unsafe upload destination: {safe_name}") from exc
+                raise
 
         try:
             opened_stat = os.fstat(fd)
             if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
                 raise UnsafeUploadPathError(f"Upload destination is not an exclusive regular file: {safe_name}")
-            os.ftruncate(fd, 0)
             fh = os.fdopen(fd, "wb")
             fd = -1
         finally:
@@ -261,7 +293,7 @@ def open_upload_file_no_symlink(base_dir: Path, filename: str) -> tuple[Path, ob
     if st is not None and st.st_nlink > 1:
         raise UnsafeUploadPathError(f"Upload destination has multiple links: {safe_name}")
 
-    flags = os.O_WRONLY | os.O_CREAT
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
 
@@ -275,18 +307,28 @@ def open_upload_file_no_symlink(base_dir: Path, filename: str) -> tuple[Path, ob
     if pre_open_st is not None and pre_open_st.st_nlink > 1:
         raise UnsafeUploadPathError(f"Upload destination has multiple links: {safe_name}")
 
-    try:
-        fd = os.open(dest, flags, 0o600)
-    except OSError as exc:
-        if exc.errno in {errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
-            raise UnsafeUploadPathError(f"Unsafe upload destination: {safe_name}") from exc
-        raise
+    seen: set[str] | None = None
+    while True:
+        try:
+            fd = os.open(dest, flags, 0o600)
+            break
+        except FileExistsError:
+            # Regular-file collision: same contract as the POSIX branch —
+            # claim the next free ``_N`` suffix and retry under O_EXCL so an
+            # existing file is never opened and truncated (issue #3750).
+            if seen is None:
+                seen = _existing_dir_names(base_dir)
+            seen.add(dest.name)
+            dest = base_dir / claim_unique_filename(dest.name, seen)
+        except OSError as exc:
+            if exc.errno in {errno.EISDIR, errno.ENOTDIR, errno.ENXIO, errno.EAGAIN}:
+                raise UnsafeUploadPathError(f"Unsafe upload destination: {safe_name}") from exc
+            raise
 
     try:
         opened_stat = os.fstat(fd)
         if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink > 1:
             raise UnsafeUploadPathError(f"Upload destination is not an exclusive regular file: {safe_name}")
-        os.ftruncate(fd, 0)
         fh = os.fdopen(fd, "wb")
         fd = -1
     finally:
@@ -335,7 +377,10 @@ def copy_upload_file_no_symlink(base_dir: Path, filename: str, src: Path) -> Pat
     ``copy2`` does, and does so before the destination is opened: opening it
     truncates, which would otherwise leave the caller copying an emptied file
     over itself. Re-uploading a file that already sits in the uploads
-    directory takes exactly that path.
+    directory takes exactly that path. A same-name collision with a different
+    file never destroys the earlier copy: the copy lands under the next free
+    ``_N`` suffix claimed by :func:`open_upload_file_no_symlink`, and the
+    returned path is the name the bytes actually landed under (issue #3750).
     """
     with open(src, "rb") as src_fh:
         src_stat = os.fstat(src_fh.fileno())

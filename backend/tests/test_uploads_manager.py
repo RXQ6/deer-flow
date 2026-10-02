@@ -212,16 +212,39 @@ class TestWriteUploadFileNoSymlink:
         assert dest == tmp_path / "notes.txt"
         assert dest.read_bytes() == b"hello"
 
-    def test_overwrites_existing_regular_file_with_single_link(self, tmp_path):
-        dest = tmp_path / "notes.txt"
-        dest.write_bytes(b"old contents")
-        assert os.stat(dest).st_nlink == 1
+    def test_collision_appends_suffix_and_preserves_existing_file(self, tmp_path):
+        """A same-name upload must never truncate the file already on disk (issue #3750)."""
+        existing = tmp_path / "notes.txt"
+        existing.write_bytes(b"old contents")
+        assert os.stat(existing).st_nlink == 1
 
         result = write_upload_file_no_symlink(tmp_path, "notes.txt", b"new contents")
 
-        assert result == dest
-        assert dest.read_bytes() == b"new contents"
-        assert os.stat(dest).st_nlink == 1
+        assert result == tmp_path / "notes_1.txt"
+        assert existing.read_bytes() == b"old contents"
+        assert result.read_bytes() == b"new contents"
+
+    def test_repeated_same_name_uploads_keep_every_version(self, tmp_path):
+        write_upload_file_no_symlink(tmp_path, "notes.txt", b"v1")
+        write_upload_file_no_symlink(tmp_path, "notes.txt", b"v2")
+
+        result = write_upload_file_no_symlink(tmp_path, "notes.txt", b"v3")
+
+        assert result == tmp_path / "notes_2.txt"
+        assert {p.read_bytes() for p in tmp_path.glob("notes*.txt")} == {b"v1", b"v2", b"v3"}
+
+    def test_collision_fallback_without_no_follow_support_preserves_existing_file(self, tmp_path, monkeypatch):
+        # When O_NOFOLLOW is absent (Windows), the function falls back to a
+        # dual-lstat + fstat approach — which must also refuse to truncate.
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+        existing = tmp_path / "notes.txt"
+        existing.write_bytes(b"old contents")
+
+        result = write_upload_file_no_symlink(tmp_path, "notes.txt", b"new contents")
+
+        assert result == tmp_path / "notes_1.txt"
+        assert existing.read_bytes() == b"old contents"
+        assert result.read_bytes() == b"new contents"
 
     def test_fallback_without_no_follow_support_succeeds(self, tmp_path, monkeypatch):
         monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
@@ -276,7 +299,8 @@ class TestCopyUploadFileNoSymlink:
         if os.utime in os.supports_fd:
             assert os.stat(dest).st_mtime_ns == 1_700_000_000_000_000_000
 
-    def test_overwrites_existing_regular_file(self, tmp_path):
+    def test_collision_copies_to_unique_name_and_preserves_existing(self, tmp_path):
+        """Re-uploading an existing name must not destroy the earlier copy (issue #3750)."""
         uploads = tmp_path / "uploads"
         uploads.mkdir()
         (uploads / "notes.txt").write_bytes(b"old contents")
@@ -285,6 +309,8 @@ class TestCopyUploadFileNoSymlink:
 
         dest = copy_upload_file_no_symlink(uploads, "notes.txt", src)
 
+        assert dest == uploads / "notes_1.txt"
+        assert (uploads / "notes.txt").read_bytes() == b"old contents"
         assert dest.read_bytes() == b"new contents"
 
     def test_rejects_symlink_destination(self, tmp_path):

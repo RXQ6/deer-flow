@@ -2966,13 +2966,20 @@ class TestUploads:
                 patch("deerflow.client.get_uploads_dir", return_value=uploads_dir),
                 patch("deerflow.client.ensure_uploads_dir", return_value=uploads_dir),
             ):
-                client.upload_files("thread-1", [authored])
+                result = client.upload_files("thread-1", [authored])
 
             from deerflow.utils.file_outline import extract_outline_for_file
 
-            assert resolve_companion(uploads_dir / "a.pdf") is None
-            assert extract_outline_for_file(uploads_dir / "a.pdf") == ([], [])
-            assert extract_outline_for_file(uploads_dir / "a_1.md")[0] == [{"title": "My notes", "line": 1}]
+            # Same-name uploads can no longer clobber an earlier file in place
+            # (issue #3750): the authored copy lands under the next free
+            # suffix, and the a.pdf companion record stays valid because its
+            # markdown was never destroyed.
+            assert result["files"][0]["filename"] == "a_1_1.md"
+            assert resolve_companion(uploads_dir / "a.pdf") == uploads_dir / "a_1.md"
+            assert (uploads_dir / "a_1.md").read_text(encoding="utf-8") == "FROM:a.pdf"
+            assert (uploads_dir / "a_1_1.md").read_text(encoding="utf-8") == "# My notes"
+            assert extract_outline_for_file(uploads_dir / "a.pdf") == ([], ["FROM:a.pdf"])
+            assert extract_outline_for_file(uploads_dir / "a_1_1.md")[0] == [{"title": "My notes", "line": 1}]
 
     def test_upload_files_failed_conversion_releases_the_claimed_markdown_name(self, client):
         """A conversion that writes nothing must not reserve stem.md against a later companion.
