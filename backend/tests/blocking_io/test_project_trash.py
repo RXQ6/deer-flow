@@ -11,6 +11,7 @@ anchor red (mutation-verified style of this suite).
 from __future__ import annotations
 
 import functools
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,12 @@ from deerflow.projects.trash import make_purge_file_remover, purge_all_trashed, 
 from deerflow.utils.file_io import run_file_io as _real_run_file_io
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.allow_blocking_io]
+pytestmark.append(
+    # Windows cannot create the deep content-addressed namespace these
+    # anchors write under pytest's tmp_path; the offload contract itself is
+    # platform-independent and stays covered on POSIX hosts.
+    pytest.mark.skipif(sys.platform == "win32", reason="document namespaces embed content-addressed hex directories that exceed Windows MAX_PATH under pytest tmp_path (WinError 206)"),
+)
 
 _USER = "u1"
 

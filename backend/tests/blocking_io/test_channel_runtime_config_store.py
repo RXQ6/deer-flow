@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -108,6 +109,8 @@ async def test_disconnect_runtime_channel_does_not_block_event_loop(tmp_path) ->
 
 
 async def test_runtime_config_store_file_is_owner_only(tmp_path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("Windows CRT chmod only toggles the read-only bit; the 0o600 mode assertion is POSIX-only")
     path = tmp_path / "channels" / "runtime-config.json"
     store = await asyncio.to_thread(ChannelRuntimeConfigStore, path)
 
@@ -128,6 +131,8 @@ async def test_runtime_config_store_overwrites_loose_existing_file(tmp_path) -> 
     code under test, so seed the destination at 0o644 first: only the store's
     atomic 0o600-temp + replace path produces an owner-only file here.
     """
+    if sys.platform == "win32":
+        pytest.skip("Windows CRT chmod only toggles the read-only bit; the 0o600 mode assertion is POSIX-only")
     path = tmp_path / "channels" / "runtime-config.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{}", encoding="utf-8")
@@ -171,5 +176,9 @@ async def test_runtime_config_store_chmod_failure_is_logged_not_fatal(tmp_path, 
 
     assert any("Unable to chmod temporary channel runtime config store" in record.getMessage() for record in caplog.records)
     mode = await asyncio.to_thread(lambda: path.stat().st_mode & 0o777)
-    assert mode == 0o600
+    if sys.platform != "win32":
+        # Windows CRT chmod only toggles the read-only bit, so the destination
+        # cannot end up 0o600 there; the log-and-continue behavior above is the
+        # platform-independent contract this test pins.
+        assert mode == 0o600
     assert await asyncio.to_thread(store.get_provider_config, "slack") == {"enabled": True, "bot_token": "xoxb-ui"}

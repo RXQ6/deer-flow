@@ -13,6 +13,7 @@ an offload drops the dispatch and turns the anchor red.
 from __future__ import annotations
 
 import functools
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -60,6 +61,7 @@ async def _shelf_document(env) -> dict:
     return result[0]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="document namespaces embed content-addressed hex directories that exceed Windows MAX_PATH under pytest tmp_path (WinError 206)")
 async def test_attach_staging_copy_dispatches_off_the_loop(tmp_path, monkeypatch) -> None:
     """The under-lock source copy (existence/size check + ``shutil.copyfile``)
     must go through ``run_file_io`` while the row lock is held."""
@@ -79,6 +81,7 @@ async def test_attach_staging_copy_dispatches_off_the_loop(tmp_path, monkeypatch
         await close_engine()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="document namespaces embed content-addressed hex directories that exceed Windows MAX_PATH under pytest tmp_path (WinError 206)")
 async def test_attach_staged_read_dispatches_off_the_loop(tmp_path, monkeypatch) -> None:
     """``read_file_chunks`` (attach ingestion source + from-thread promote
     source) must dispatch the open, every chunk read, and the close through

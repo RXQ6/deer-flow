@@ -4,8 +4,16 @@
 the real ``socket.getaddrinfo``, which expands it to 127.0.0.1 without any DNS
 traffic. The strict gate's ``socket.getaddrinfo`` rule fails each test if the
 tool resolves on the loop instead of in a worker thread.
+
+On Windows, WinSock has no short-form IPv4 expansion, so ``getaddrinfo("127.1")``
+fails resolution instead of returning the loopback address. The guard still
+resolves off-loop and still refuses the URL before any client is built, so the
+tests stay alive there with the resolution-failure message; only POSIX observes
+the private-address refusal text.
 """
 
+import re
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +26,18 @@ from deerflow.community.crawl4ai import tools as crawl4ai_tools
 pytestmark = pytest.mark.asyncio
 
 _UNRESOLVED_LOOPBACK_URL = "http://127.1/"
+_WIN32 = sys.platform == "win32"
+
+
+def _expected_refusal(prefix: str) -> str:
+    """Return the expected guard refusal for the running platform.
+
+    ``prefix`` is the POSIX refusal verb ("fetch", "capture", "browse"); Windows
+    resolves ``127.1`` to a resolution failure before the private-address check.
+    """
+    if _WIN32:
+        return "Error: URL host could not be resolved"
+    return f"Error: Refusing to {prefix} a private, loopback, or metadata address"
 
 
 async def test_crawl4ai_web_fetch_resolves_off_loop() -> None:
@@ -27,7 +47,7 @@ async def test_crawl4ai_web_fetch_resolves_off_loop() -> None:
     ):
         result = await crawl4ai_tools.web_fetch_tool.ainvoke({"url": _UNRESOLVED_LOOPBACK_URL})
 
-    assert result == "Error: Refusing to fetch a private, loopback, or metadata address"
+    assert result == _expected_refusal("fetch")
     build_client.assert_not_called()
 
 
@@ -38,7 +58,7 @@ async def test_browserless_web_fetch_resolves_off_loop() -> None:
     ):
         result = await browserless_tools.web_fetch_tool.ainvoke({"url": _UNRESOLVED_LOOPBACK_URL})
 
-    assert result == "Error: Refusing to fetch a private, loopback, or metadata address"
+    assert result == _expected_refusal("fetch")
     get_client.assert_not_called()
 
 
@@ -53,7 +73,7 @@ async def test_browserless_web_capture_resolves_off_loop() -> None:
             tool_call_id="call-1",
         )
 
-    assert result.update["messages"][0].content == "Error: Refusing to capture a private, loopback, or metadata address"
+    assert result.update["messages"][0].content == _expected_refusal("capture")
     get_client.assert_not_called()
 
 
@@ -69,7 +89,7 @@ async def test_browser_navigate_tool_resolves_off_loop() -> None:
             tool_call_id="call-1",
         )
 
-    assert result.update["messages"][0].content == "Error: Refusing to browse a private, loopback, or metadata address"
+    assert result.update["messages"][0].content == _expected_refusal("browse")
     manager.acquire_session.assert_not_called()
 
 
@@ -78,7 +98,7 @@ async def test_browser_navigate_and_capture_resolves_off_loop(tmp_path) -> None:
     with (
         patch.object(browser_tools, "_get_tool_config", return_value={}),
         patch.object(browser_tools, "get_browser_session_manager", return_value=manager),
-        pytest.raises(ValueError, match="Refusing to browse a private, loopback, or metadata address"),
+        pytest.raises(ValueError, match=re.escape(_expected_refusal("browse"))),
     ):
         await browser_tools.navigate_and_capture(thread_id="thread-1", url=_UNRESOLVED_LOOPBACK_URL, outputs_path=tmp_path)
 
